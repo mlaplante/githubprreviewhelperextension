@@ -8,6 +8,8 @@ import type { FileAnalysisResults } from '../types';
 import { inlineAnnotator } from './inline-annotator';
 import { summaryPanel } from './summary-panel';
 import { tooltipManager } from './tooltip';
+import { initKeyboardNavigation, destroyKeyboardNavigation } from './keyboard-handler';
+import { initQuickComments, destroyQuickComments } from './quick-comments';
 
 /**
  * UI System - Manages all UI components
@@ -28,6 +30,12 @@ export class UISystem {
 
       // Setup event listeners
       this.setupEventListeners();
+
+      // Initialize keyboard navigation
+      initKeyboardNavigation();
+
+      // Initialize quick comments
+      initQuickComments();
 
       this.isInitialized = true;
       console.log('✅ UI System initialized');
@@ -259,6 +267,12 @@ export class UISystem {
   destroy(): void {
     this.clear();
     summaryPanel.destroy();
+
+    // Cleanup keyboard navigation
+    destroyKeyboardNavigation();
+
+    // Cleanup quick comments
+    destroyQuickComments();
 
     // Remove injected CSS
     if (this.styleElement?.parentElement) {

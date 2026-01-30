@@ -14,6 +14,11 @@ import { getJavaScriptDebugRules } from './javascript-debug';
 import { getJavaScriptDebugExtendedRules } from './javascript-debug-extended';
 import { getCSharpSecurityRules } from './csharp-security';
 import { getCSharpDebugRules } from './csharp-debug';
+import { getAWSSecretRules } from './secrets-aws';
+import { getTokenSecretRules } from './secrets-tokens';
+import { getDatabaseSecretRules } from './secrets-database';
+import { getPrivateKeySecretRules } from './secrets-keys';
+import { getGenericSecretRules } from './secrets-generic';
 
 /**
  * Get all available rules
@@ -29,6 +34,11 @@ export function getAllRules(): Rule[] {
     ...getJavaScriptDebugExtendedRules(),
     ...getCSharpSecurityRules(),
     ...getCSharpDebugRules(),
+    ...getAWSSecretRules(),
+    ...getTokenSecretRules(),
+    ...getDatabaseSecretRules(),
+    ...getPrivateKeySecretRules(),
+    ...getGenericSecretRules(),
   ];
 }
 
