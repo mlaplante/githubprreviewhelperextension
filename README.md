@@ -15,7 +15,7 @@ GitHub Code Review Assistant is a Chrome/Edge extension that enhances your GitHu
   - **Code quality issues** (TODO comments, loose equality, error handling, etc.)
   - **Debug code detection** (console.log, debugger statements, test credentials)
   - **Secret detection** (API keys, AWS credentials, database passwords, private keys)
-  - **HTML accessibility** (WCAG 2.1 compliance)
+  - **HTML accessibility** (WCAG 2.1 accessibility checks)
   - **TypeScript quality** (type safety, proper error suppression)
 - **Multi-language Support**: JavaScript, TypeScript, HTML, CSS, C#, JSX, TSX
 - **Real-time Feedback**: Provides instant feedback on PR file changes
@@ -297,7 +297,7 @@ The extension includes **131 rules** across multiple categories:
 - Profiling and timing code
 
 ### HTML Accessibility (4 rules)
-- WCAG 2.1 compliance:
+- WCAG 2.1 accessibility checks:
   - Missing alt attributes on images
   - Missing lang attributes on HTML
   - Button type attributes
