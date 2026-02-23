@@ -297,11 +297,11 @@ The extension includes **131 rules** across multiple categories:
 - Profiling and timing code
 
 ### HTML Accessibility (4 rules)
-- WCAG 2.1 compliance checks
-- Missing alt attributes on images
-- Missing lang attributes on HTML
-- Button type attributes
-- Anchor tags without href
+- WCAG 2.1 compliance:
+  - Missing alt attributes on images
+  - Missing lang attributes on HTML
+  - Button type attributes
+  - Anchor tags without href
 
 ### By Language
 - **JavaScript/TypeScript**: 50+ rules
