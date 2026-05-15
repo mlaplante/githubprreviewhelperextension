@@ -7,6 +7,8 @@
 
 import * as core from '@actions/core';
 import * as github from '@actions/github';
+import * as fs from 'fs';
+import * as path from 'path';
 import { analyzeCode } from '../dist/analyzer.js';
 import { getAllRules } from '../dist/rules/index.js';
 
@@ -260,6 +262,167 @@ async function syncCriticalLabel(octokit, owner, repo, prNumber, labelName, hasC
   }
 }
 
+// ------- security context config ------------------------------------------
+
+const CONFIG_PATH = '.security/config.json';
+
+const DEFAULT_CONFIG = {
+  // Glob-ish substrings that mark a path as test / fixture / vendored.
+  // Findings in these paths are suppressed by default.
+  suppressPaths: [
+    '/__tests__/', '/__mocks__/', '/test/', '/tests/', '/spec/',
+    '/fixtures/', '/fixture/', '/vendor/', '/node_modules/',
+    '/dist/', '/build/', '/.next/', '/coverage/',
+    '.test.', '.spec.', '.stories.', '.fixture.',
+  ],
+  // Path substrings that indicate an attack-surface entry point — findings
+  // here are bumped one severity level (info→warning, warning→critical).
+  attackSurfacePaths: [
+    '/controllers/', '/controller/', '/routes/', '/route/',
+    '/handlers/', '/handler/', '/api/', '/pages/api/',
+    '/middleware/', '/endpoints/', '/webhooks/',
+  ],
+  // Rule IDs to suppress entirely.
+  ignoreRules: [],
+  // { ruleId: severity } — pin a rule to a specific severity (overrides bump).
+  ruleSeverityOverrides: {},
+};
+
+function loadConfig(workspace) {
+  const full = path.join(workspace, CONFIG_PATH);
+  if (!fs.existsSync(full)) return DEFAULT_CONFIG;
+  try {
+    const raw = JSON.parse(fs.readFileSync(full, 'utf-8'));
+    return { ...DEFAULT_CONFIG, ...raw };
+  } catch (err) {
+    core.warning(`Could not parse ${CONFIG_PATH}: ${err.message} — using defaults.`);
+    return DEFAULT_CONFIG;
+  }
+}
+
+// ------- suppression -------------------------------------------------------
+
+function pathMatchesAny(filePath, needles) {
+  const normalized = '/' + filePath.replace(/\\/g, '/');
+  return needles.some(n => normalized.includes(n));
+}
+
+function isCommentLine(line, language) {
+  if (!line) return false;
+  const trimmed = line.trim();
+  if (trimmed === '') return false;
+  if (language === 'html') return trimmed.startsWith('<!--');
+  if (language === 'css') return trimmed.startsWith('/*') || trimmed.startsWith('*');
+  // js/ts/cs/svelte
+  return trimmed.startsWith('//') || trimmed.startsWith('/*') || trimmed.startsWith('*');
+}
+
+function suppressFinding(issue, file, config, codeLines) {
+  if (config.ignoreRules.includes(issue.ruleId)) return 'ignored-rule';
+  if (pathMatchesAny(file.filePath, config.suppressPaths)) return 'suppressed-path';
+  const line = codeLines[issue.lineNumber - 1];
+  if (isCommentLine(line, file.language)) return 'comment-line';
+  return null;
+}
+
+// ------- cross-rule dedup --------------------------------------------------
+
+const SEVERITY_ORDER = ['info', 'warning', 'critical'];
+
+/**
+ * Collapse multiple findings on the same line whose messages overlap
+ * (e.g. several secrets-* rules hitting the same token). Keeps the
+ * highest-severity issue and records the collapsed ruleIds.
+ */
+function collapseSameLine(results) {
+  const byLine = new Map();
+  for (const r of results) {
+    const key = r.lineNumber;
+    if (!byLine.has(key)) byLine.set(key, []);
+    byLine.get(key).push(r);
+  }
+
+  const out = [];
+  for (const [, group] of byLine) {
+    if (group.length === 1) { out.push(group[0]); continue; }
+
+    // Bucket by rule "family" (prefix before first dash group, e.g. SECRETS, JS-SEC).
+    const families = new Map();
+    for (const r of group) {
+      const fam = (r.ruleId || '').split('-').slice(0, 2).join('-') || r.ruleId;
+      if (!families.has(fam)) families.set(fam, []);
+      families.get(fam).push(r);
+    }
+
+    for (const [, fam] of families) {
+      fam.sort((a, b) =>
+        SEVERITY_ORDER.indexOf(b.severity) - SEVERITY_ORDER.indexOf(a.severity));
+      const winner = fam[0];
+      if (fam.length > 1) {
+        winner._collapsedRuleIds = fam.slice(1).map(r => r.ruleId);
+      }
+      out.push(winner);
+    }
+  }
+  return out.sort((a, b) => a.lineNumber - b.lineNumber);
+}
+
+// ------- attack-surface reweighting ----------------------------------------
+
+function bumpSeverity(sev) {
+  const i = SEVERITY_ORDER.indexOf(sev);
+  if (i < 0 || i === SEVERITY_ORDER.length - 1) return sev;
+  return SEVERITY_ORDER[i + 1];
+}
+
+function reweight(issue, file, config) {
+  const pinned = config.ruleSeverityOverrides[issue.ruleId];
+  if (pinned) return { ...issue, severity: pinned };
+  if (pathMatchesAny(file.filePath, config.attackSurfacePaths)) {
+    const bumped = bumpSeverity(issue.severity);
+    if (bumped !== issue.severity) {
+      return {
+        ...issue,
+        severity: bumped,
+        message: issue.message + ' _(attack-surface path — severity bumped)_',
+      };
+    }
+  }
+  return issue;
+}
+
+// ------- metrics -----------------------------------------------------------
+
+function writeMetrics(workspace, metrics) {
+  try {
+    const out = path.join(workspace, 'code-review-metrics.json');
+    fs.writeFileSync(out, JSON.stringify(metrics, null, 2));
+    core.info(`Wrote metrics to ${out}`);
+  } catch (err) {
+    core.warning(`Could not write metrics file: ${err.message}`);
+  }
+
+  const summary = process.env.GITHUB_STEP_SUMMARY;
+  if (summary) {
+    try {
+      const lines = [
+        '## Code Review Assistant — run metrics',
+        '',
+        `- Files analyzed: **${metrics.filesAnalyzed}**`,
+        `- Raw findings: **${metrics.rawCount}**`,
+        `- Suppressed: **${metrics.suppressedCount}** (path: ${metrics.suppressedByReason['suppressed-path'] || 0}, comment: ${metrics.suppressedByReason['comment-line'] || 0}, ignored-rule: ${metrics.suppressedByReason['ignored-rule'] || 0})`,
+        `- Collapsed (cross-rule dedup): **${metrics.collapsedCount}**`,
+        `- Severity bumps (attack-surface): **${metrics.bumpedCount}**`,
+        `- Final: ${metrics.final.critical} critical · ${metrics.final.warning} warning · ${metrics.final.info} info`,
+        '',
+      ];
+      fs.appendFileSync(summary, lines.join('\n'));
+    } catch (err) {
+      core.warning(`Could not write step summary: ${err.message}`);
+    }
+  }
+}
+
 // ------- main action -------------------------------------------------------
 
 async function run() {
@@ -280,6 +443,8 @@ async function run() {
     const pr = ctx.payload.pull_request;
     const { owner, repo } = ctx.repo;
     const prNumber = pr.number;
+    const workspace = process.env.GITHUB_WORKSPACE || process.cwd();
+    const config = loadConfig(workspace);
 
     core.info(`Analyzing PR #${prNumber} (${owner}/${repo})…`);
 
@@ -290,7 +455,15 @@ async function run() {
 
     const allRules = getAllRules();
     const allFileResults = [];
-    let criticalCount = 0, warningCount = 0, infoCount = 0;
+    const metrics = {
+      filesAnalyzed: 0,
+      rawCount: 0,
+      suppressedCount: 0,
+      suppressedByReason: {},
+      collapsedCount: 0,
+      bumpedCount: 0,
+      final: { critical: 0, warning: 0, info: 0 },
+    };
 
     for (const file of changedFiles) {
       if (file.status === 'removed') continue;
@@ -315,25 +488,53 @@ async function run() {
         continue;
       }
 
+      metrics.filesAnalyzed++;
+
       const rawResults = analyzeCode(code, language, allRules, file.filename);
+      metrics.rawCount += rawResults.results.length;
 
-      // Apply severity threshold filter
-      rawResults.results = rawResults.results.filter(r =>
-        meetsThreshold(r.severity, severityThreshold),
-      );
+      // ---- pipeline: suppress -> collapse -> reweight -> threshold ----
+      const codeLines = code.split('\n');
+      const fileMeta = { filePath: file.filename, language };
 
-      if (rawResults.results.length === 0) continue;
+      const surviving = [];
+      for (const issue of rawResults.results) {
+        const reason = suppressFinding(issue, fileMeta, config, codeLines);
+        if (reason) {
+          metrics.suppressedCount++;
+          metrics.suppressedByReason[reason] = (metrics.suppressedByReason[reason] || 0) + 1;
+          continue;
+        }
+        surviving.push(issue);
+      }
 
-      // Store the diff patch so postInlineReview can map issues to diff lines
+      const beforeCollapse = surviving.length;
+      const collapsed = collapseSameLine(surviving);
+      metrics.collapsedCount += beforeCollapse - collapsed.length;
+
+      const reweighted = collapsed.map(r => {
+        const next = reweight(r, fileMeta, config);
+        if (next.severity !== r.severity) metrics.bumpedCount++;
+        return next;
+      });
+
+      const final = reweighted.filter(r => meetsThreshold(r.severity, severityThreshold));
+      if (final.length === 0) continue;
+
+      rawResults.results = final;
       rawResults.patch = file.patch;
-
       allFileResults.push(rawResults);
-      for (const r of rawResults.results) {
-        if (r.severity === 'critical') criticalCount++;
-        else if (r.severity === 'warning') warningCount++;
-        else infoCount++;
+
+      for (const r of final) {
+        if (r.severity === 'critical') metrics.final.critical++;
+        else if (r.severity === 'warning') metrics.final.warning++;
+        else metrics.final.info++;
       }
     }
+
+    const criticalCount = metrics.final.critical;
+    const warningCount = metrics.final.warning;
+    const infoCount = metrics.final.info;
 
     const summary = {
       total: criticalCount + warningCount + infoCount,
@@ -343,6 +544,8 @@ async function run() {
     };
 
     core.info(`Analysis complete: ${summary.total} issue(s) found (${criticalCount} critical, ${warningCount} warning, ${infoCount} info)`);
+    core.info(`Pipeline: raw=${metrics.rawCount} suppressed=${metrics.suppressedCount} collapsed=${metrics.collapsedCount} bumped=${metrics.bumpedCount}`);
+    writeMetrics(workspace, metrics);
 
     // Post inline review comments on diff lines
     try {
